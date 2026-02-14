@@ -1,0 +1,39 @@
+# Sample vLLM Wizard Profile
+# Use with: vllm-wizard plan --profile sample.yaml
+
+profile_version: 1
+
+model:
+  id: "meta-llama/Llama-2-7b-hf"
+  revision: null
+  dtype: "auto"
+  quantization: "none"
+  kv_cache_dtype: "auto"
+  max_model_len: 4096
+  params_b: null  # Auto-detect from model config
+
+hardware:
+  gpu_name: "RTX 4090"
+  gpus: 1
+  vram_gb: null  # Auto-detect or use known GPU specs
+  interconnect: "unknown"
+  tp_size: null  # Auto-select based on GPU count
+
+workload:
+  prompt_tokens: 512
+  gen_tokens: 256
+  concurrency: 4
+  streaming: true
+  mode: "balanced"  # Options: throughput, latency, balanced
+
+policy:
+  gpu_memory_utilization: 0.90
+  overhead_gb: null  # Auto-calculate
+  fragmentation_factor: 1.15
+  headroom_gb: 1.0
+
+outputs:
+  emit:
+    - command
+    - profile
+  vllm_args: {}  # Additional vLLM args (passthrough)

@@ -1,0 +1,504 @@
+
+MVP: vLLM Config Wizard + Sizing Calculator
+
+0) Goal
+
+Build a tool that, given model + hardware + workload, generates:
+	1.	Feasibility: “will it fit?” with a VRAM budget breakdown
+	2.	Recommended vLLM configuration: runnable command + config file(s)
+	3.	Approx performance metrics: throughput/latency ranges with clear assumptions
+	4.	Optional: local hardware auto-detection and calibration benchmark hook
+
+Primary audience: a single practitioner sizing GPUs and getting vLLM running.
+
+Non-goals (MVP): multi-tenant auth, billing, distributed tracing, full autoscaling, deep benchmarking suite.
+
+⸻
+
+1) Deliverables
+
+1.1 Packaging
+	•	Python package published to PyPI (or ready to publish) with name: vllm-wizard (placeholder).
+	•	CLI entrypoint: vllm-wizard
+	•	Optional web UI shipped as:
+	•	vllm-wizard web command (FastAPI server), OR
+	•	a separate web/ app calling the same Python core.
+
+1.2 Artifacts generated
+
+Given inputs, generate:
+	•	vLLM serve command (copy-paste)
+	•	YAML config profile (tool’s own schema) that can be reloaded
+	•	docker command and/or docker-compose.yaml (optional but recommended)
+	•	Kubernetes snippet (optional, behind a flag)
+
+1.3 Output reports
+	•	Console report (rich text)
+	•	JSON output (--json) for scripting
+	•	For web: JSON API + HTML UI
+
+⸻
+
+2) Supported runtime environments
+	•	OS: Linux (first-class), macOS/Windows best-effort (CLI works, GPU detection may not).
+	•	GPUs:
+	•	NVIDIA via nvidia-smi
+	•	Optional ROCm support via rocminfo/rocm-smi (MVP can stub or partial)
+	•	Python: 3.10–3.12
+
+⸻
+
+3) High-level architecture
+
+3.1 Core library modules (pure Python, no UI)
+	1.	models/metadata.py
+	•	Load model config from:
+	•	local path containing config.json
+	•	Hugging Face model id (optional online; if offline, require local)
+	•	Extract architecture fields needed for memory math:
+	•	num_hidden_layers
+	•	hidden_size
+	•	attention heads (num_attention_heads)
+	•	KV heads (num_key_value_heads if available, else = heads)
+	•	vocab_size (optional)
+	•	max_position_embeddings (optional)
+	•	model type / family string (for perf heuristics)
+	2.	hardware/detect.py
+	•	Detect GPU(s) on local machine:
+	•	name, total VRAM MiB, compute capability (if available), driver/CUDA version (optional)
+	•	Output a normalized list of GPUs and a recommended tensor_parallel_size.
+	3.	planning/memory.py
+	•	Compute VRAM usage breakdown and feasibility:
+	•	weights memory (dtype/quant)
+	•	KV cache memory (context, concurrency, kv dtype)
+	•	overhead (framework + fragmentation buffer)
+	•	Return headroom and “OOM risk” classification.
+	4.	planning/perf.py
+	•	Compute approximate metrics (ranges):
+	•	prefill tokens/s (optional)
+	•	decode tokens/s
+	•	time-to-first-token (TTFT) estimate
+	•	Use simple heuristic model + calibration table.
+	5.	planning/recommend.py
+	•	Given inputs and constraints, pick recommended:
+	•	dtype / kv dtype
+	•	gpu_memory_utilization
+	•	max_model_len
+	•	tensor_parallel_size
+	•	quantization flags
+	•	swap_space suggestion
+	•	batching/concurrency suggestions (if user provides SLO)
+	6.	render/commands.py
+	•	Render:
+	•	vLLM CLI command string
+	•	docker command
+	•	compose yaml
+	•	tool profile yaml/json
+	7.	schemas/
+	•	Pydantic models for:
+	•	Input request
+	•	Output plan
+	•	Generated artifacts
+	•	Versioned profile format
+
+3.2 Frontends
+	•	CLI: Typer (preferred) or Click
+	•	Web: FastAPI + minimal HTML (Jinja2) or a single-page UI (HTMX optional)
+
+Both call the same core planner functions.
+
+⸻
+
+4) Functional requirements
+
+4.1 Inputs
+
+Tool must accept inputs via CLI flags, JSON, YAML profile, and web form.
+
+4.1.1 Model inputs
+	•	--model: HF model id OR local path
+	•	--revision (optional)
+	•	--trust-remote-code (optional, default false)
+	•	--dtype: auto | fp16 | bf16 | fp32
+	•	--quantization: none | awq | gptq | int8 | fp8 (MVP may support only none, awq, gptq as strings; mapping to vLLM flags)
+	•	--kv-cache-dtype: auto | fp16 | bf16 | fp8_e4m3fn | fp8_e5m2 (string passthrough; default auto)
+	•	--max-model-len: integer (target)
+	•	--tokenizer (optional override)
+
+4.1.2 Hardware inputs
+
+Either auto-detect or user-provided.
+	•	--gpu: free text (e.g., “RTX 4090”, “A100 80GB”) OR auto
+	•	--gpus: integer count
+	•	--vram-gb: numeric per GPU (if not auto)
+	•	--interconnect: pcie | nvlink | unknown (affects perf scaling heuristics only)
+	•	--tensor-parallel-size: integer or auto
+
+4.1.3 Workload inputs
+	•	--prompt-tokens: integer (typical)
+	•	--gen-tokens: integer (typical)
+	•	--concurrency: integer (simultaneous sequences)
+	•	--target-latency-ms (optional)
+	•	--streaming: boolean
+	•	--batching-mode: throughput | latency | balanced (default balanced)
+
+4.1.4 Policy / safety margins
+	•	--gpu-memory-utilization: 0.50–0.98 (default 0.90)
+	•	--overhead-gb: default 1–3GB depending on GPU size (see memory model)
+	•	--fragmentation-factor: default 1.10–1.25 applied to KV cache or total
+	•	--headroom-gb: minimum headroom (default 1GB)
+
+4.1.5 Output selection
+	•	--output-dir: path
+	•	--format: text | json | yaml
+	•	--emit: command,profile,compose,k8s (comma list)
+	•	--json shorthand for --format json
+	•	--explain: include explanations for each recommended parameter
+
+⸻
+
+4.2 Outputs
+
+4.2.1 Feasibility report fields (must be present)
+	•	fits: bool
+	•	oom_risk: low|medium|high
+	•	vram_total_gb
+	•	vram_target_alloc_gb (total * gpu_memory_utilization)
+	•	weights_gb
+	•	kv_cache_gb
+	•	overhead_gb
+	•	headroom_gb
+	•	max_concurrency_at_context (computed)
+	•	max_context_at_concurrency (computed)
+	•	Warnings list (strings)
+
+4.2.2 Recommended vLLM serve config (must be present)
+
+Generate a dict of vLLM args:
+	•	model
+	•	tensor_parallel_size
+	•	dtype
+	•	gpu_memory_utilization
+	•	max_model_len
+	•	kv_cache_dtype (if specified)
+	•	quantization (if specified)
+	•	optional:
+	•	swap_space
+	•	enforce_eager (only if needed; default no)
+	•	disable_log_stats (optional)
+	•	max_num_seqs suggestion derived from concurrency
+	•	max_num_batched_tokens suggestion derived from prompt/gen and mode
+
+4.2.3 Approx performance metrics (must be present, clearly labeled approximate)
+
+Return ranges:
+	•	decode_toks_per_s_range: [low, high]
+	•	prefill_toks_per_s_range: [low, high] (optional)
+	•	ttft_ms_range: [low, high] (optional)
+Also return:
+	•	assumptions: list of strings used in estimation
+
+4.2.4 Generated artifacts
+	•	serve_command.sh (or just string)
+	•	profile.yaml (tool schema)
+	•	optional docker-compose.yaml
+	•	optional k8s-values.yaml
+
+⸻
+
+5) Computation requirements (core logic)
+
+5.1 Model metadata extraction
+
+Implement robust extraction from model config:
+	•	Read config.json (HF format) and map across common families:
+	•	LLaMA-like: num_hidden_layers, hidden_size, num_attention_heads, num_key_value_heads
+	•	Mistral-like similar
+	•	Qwen, Gemma, Falcon: best-effort; if missing, fail with actionable error
+	•	Must handle missing KV heads by setting num_key_value_heads = num_attention_heads.
+
+If remote HF fetching is supported:
+	•	Use huggingface_hub to download config + tokenizer config
+	•	Respect --trust-remote-code (do not execute code; only read config files)
+
+5.2 Memory model (must implement)
+
+5.2.1 Units and precision
+	•	Work internally in bytes; present outputs in GiB (base 1024).
+
+5.2.2 Weights memory
+
+Compute weights size using one of:
+	•	If safetensors index provides total parameter bytes: use that (best).
+	•	Else estimate parameters count if available in config; if not available:
+	•	fallback to “known model size lookup table” keyed by model id prefix (optional)
+	•	if unknown, require user --params-b input (billions) OR fail.
+(MVP acceptable approach: implement lookup table for common families + allow override.)
+
+Map dtype/quant to bytes/param (approx):
+	•	fp32: 4
+	•	fp16/bf16: 2
+	•	int8: 1
+	•	4-bit (awq/gptq): 0.5 (plus overhead factor e.g. 1.1 to account for scales/zeros)
+Require: include quant overhead factor in assumptions.
+
+5.2.3 KV cache memory (critical)
+
+Per token per layer KV bytes:
+	•	For each layer:
+	•	K: num_kv_heads * head_dim
+	•	V: same
+	•	total elements per token per layer = 2 * num_kv_heads * head_dim
+Where head_dim = hidden_size / num_attention_heads.
+
+KV bytes per element = bytes for kv_cache_dtype (default to dtype if auto).
+Then:
+	•	kv_cache_bytes = elements_per_token_per_layer * num_layers * tokens_in_cache * concurrency * bytes_per_elem
+
+Where:
+	•	tokens_in_cache = max_model_len (or user context target)
+	•	concurrency = number of sequences kept in cache (often = max_num_seqs)
+
+Apply fragmentation/safety:
+	•	kv_cache_bytes *= fragmentation_factor (default 1.15)
+
+5.2.4 Overhead
+
+Model:
+	•	overhead_gb = max(1.0, 0.02 * vram_total_gb) (example rule)
+	•	plus additional for multi-gpu communication buffers: + 0.25 * (tp_size-1) GB (heuristic)
+
+Make overhead tunable via --overhead-gb.
+
+5.2.5 Feasibility
+	•	allocatable = vram_total * gpu_memory_utilization
+	•	required = weights + kv_cache + overhead
+	•	headroom = allocatable - required
+Fits if:
+	•	headroom >= headroom_gb and required <= allocatable
+
+Risk level:
+	•	low if headroom >= 2GB
+	•	medium if 0–2GB
+	•	high if negative or within tiny margin
+
+5.2.6 Compute “max concurrency at context” and “max context at concurrency”
+
+Solve for:
+	•	max concurrency given fixed context:
+	•	concurrency_max = floor((allocatable - weights - overhead) / kv_cache_per_seq_at_context)
+	•	max context given fixed concurrency:
+	•	context_max = floor((allocatable - weights - overhead) / (kv_cache_per_token_per_seq)) / concurrency
+
+Return these as integers, clamped >=0.
+
+5.3 Recommendation logic
+
+Given user inputs, produce recommended:
+	•	TP size:
+	•	if auto:
+	•	choose min(num_gpus, largest power-of-two <= num_gpus) OR just num_gpus
+	•	but ensure model weights per GPU fit (weights/TP)
+	•	max_model_len:
+	•	if user set, keep it; otherwise use min(model’s max, context_max at desired concurrency)
+	•	gpu_memory_utilization:
+	•	default 0.90; lower if on consumer GPU (heuristic by name contains “RTX”) to 0.88
+	•	quantization:
+	•	if doesn’t fit, recommend 4-bit (awq/gptq) as “try this”
+	•	kv_cache_dtype:
+	•	if long context pressure, suggest fp8 if user allows and GPU supports (MVP: suggest but label “experimental”)
+	•	max_num_seqs:
+	•	set to requested concurrency (or slightly above for throughput mode)
+	•	max_num_batched_tokens:
+	•	for balanced: (prompt_tokens + gen_tokens) * concurrency capped to a safe ceiling (e.g. 8192–65536 range depending on VRAM)
+	•	keep logic simple, explainable
+
+5.4 Performance estimation (approx)
+
+Implement a heuristic estimator that returns ranges.
+Minimum viable approach:
+	•	Define baseline decode TPS per GPU class bucket (table):
+	•	consumer high-end (4090/3090), datacenter (A100/H100/L40S), etc.
+	•	Scale by:
+	•	model size (params): TPS inversely proportional to params^α (α ~ 0.7–1.0)
+	•	tensor parallel: some penalty factor for PCIe vs NVLink
+	•	quantization: speedup factor (small) and/or memory relief (main)
+	•	context length: TTFT increases with prompt tokens; decode TPS mildly decreases with longer context
+
+Return:
+	•	decode_low = base * 0.7, decode_high = base * 1.3 after scaling (simple range)
+	•	ttft_ms ≈ prompt_tokens / prefill_tps * 1000 (range)
+	•	Always include assumptions strings:
+	•	“Heuristic estimate; real performance depends on kernel selection, driver, batching, and vLLM version.”
+
+MVP must ensure output is clearly labeled approximate.
+
+⸻
+
+6) CLI Requirements
+
+6.1 Commands
+	1.	vllm-wizard plan
+
+	•	Computes feasibility, recommendations, perf estimates
+	•	Does not write files unless --output-dir or --emit includes artifacts
+	•	Supports --json output
+
+	2.	vllm-wizard generate
+
+	•	Always emits artifacts to --output-dir
+	•	prints next steps
+
+	3.	vllm-wizard detect
+
+	•	Prints detected GPU inventory (JSON/text)
+
+	4.	vllm-wizard web (optional)
+
+	•	Starts FastAPI server on --host/--port
+
+6.2 UX requirements
+	•	Human-readable report includes:
+	•	“Fits / Does not fit”
+	•	VRAM table
+	•	Recommended command (single line)
+	•	3–10 warnings/suggestions
+	•	--explain prints “why” next to each recommended parameter.
+
+⸻
+
+7) Web App Requirements (optional but recommended)
+
+7.1 UI pages
+
+Single page with sections:
+	•	Model
+	•	Hardware
+	•	Workload
+	•	Results (tabs: Summary / Command / Files / JSON)
+
+7.2 Backend API
+
+FastAPI endpoints:
+	•	POST /api/plan → returns JSON PlanResponse
+	•	POST /api/generate → returns JSON and optionally a zip of artifacts
+	•	GET /api/gpus → returns detected GPU info (server machine)
+
+Security note: MVP runs locally; no auth required.
+
+⸻
+
+8) Profile format (tool-owned)
+
+8.1 profile.yaml schema (versioned)
+
+Fields:
+	•	profile_version: 1
+	•	model: { id/path, revision?, dtype, quantization, kv_cache_dtype, max_model_len }
+	•	hardware: { gpu_name, gpus, vram_gb, interconnect, tp_size }
+	•	workload: { prompt_tokens, gen_tokens, concurrency, streaming, mode }
+	•	policy: { gpu_memory_utilization, overhead_gb, fragmentation_factor, headroom_gb }
+	•	outputs: { emit: [...], vllm_args: {...} }
+
+Must support loading this profile to re-run plan and regenerate artifacts.
+
+⸻
+
+9) Templates to generate
+
+9.1 vLLM serve command
+
+Output example (string, do not hardcode exact flags; derive from args):
+	•	vllm serve <model> --tensor-parallel-size <n> --dtype <dtype> --gpu-memory-utilization <x> --max-model-len <L> ...
+
+9.2 Docker command (optional)
+	•	docker run --gpus all -p 8000:8000 -v $HF_HOME:/root/.cache/huggingface vllm/vllm-openai:latest ...
+
+9.3 docker-compose.yaml (optional)
+	•	Include GPU reservation and ports
+	•	Mount HF cache volume
+
+9.4 K8s values.yaml (optional)
+	•	Only if you want; keep minimal.
+
+⸻
+
+10) Setup instructions (for your repo)
+
+10.1 Repo structure
+
+vllm-wizard/
+  pyproject.toml
+  README.md
+  src/vllm_wizard/
+    __init__.py
+    cli.py
+    schemas/
+    models/
+    hardware/
+    planning/
+    render/
+    webapp/   (optional)
+  tests/
+  examples/
+    profiles/
+    sample_outputs/
+
+10.2 Dependencies
+
+Core:
+	•	pydantic>=2
+	•	typer>=0.12
+	•	rich
+	•	pyyaml
+Optional:
+	•	huggingface_hub (if HF id fetch supported)
+	•	fastapi, uvicorn, jinja2 (web)
+
+10.3 Dev tooling
+	•	pytest
+	•	ruff
+	•	mypy (optional)
+	•	pre-commit (optional)
+
+10.4 Installation
+	•	Editable: pip install -e ".[dev,web]"
+
+⸻
+
+11) Testing requirements
+
+11.1 Unit tests
+	•	Model config parsing for at least:
+	•	LLaMA-like config fixture
+	•	config missing num_key_value_heads (fallback works)
+	•	KV cache math correctness (known small example)
+	•	Feasibility boundary tests (fits vs not)
+	•	CLI smoke tests:
+	•	plan --json returns valid JSON schema
+
+11.2 Golden tests
+	•	Provide examples/profiles/*.yaml
+	•	Store expected outputs under examples/sample_outputs/ and compare (allow small numeric tolerances for perf estimates)
+
+⸻
+
+12) Error handling requirements
+	•	If model metadata cannot be derived:
+	•	error message must say exactly what field is missing and how to fix:
+	•	“Provide --params-b” or “Use local config.json”
+	•	If GPU detection fails:
+	•	tool continues if user provided --vram-gb and --gpus
+	•	Any estimate must be labeled approximate; never present as guarantee.
+
+⸻
+
+13) Documentation requirements (README must include)
+	•	Quick start examples:
+	•	single GPU config generation
+	•	sizing question “how many GPUs for X?”
+	•	Explanation of memory breakdown (weights vs KV)
+	•	Disclaimer about perf approximation
+	•	“How to interpret warnings”
+	•	“How to run web UI”
+

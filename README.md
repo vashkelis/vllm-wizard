@@ -293,7 +293,7 @@ ruff check src/
 
 ## License
 
-MIT
+APACHE 2.0
 
 ## Disclaimer
 

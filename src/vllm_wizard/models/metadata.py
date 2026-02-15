@@ -1,12 +1,9 @@
-"""Model metadata extraction from local config or HuggingFace Hub."""
+"""Model metadata extraction - offline estimation."""
 
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-
-from huggingface_hub import hf_hub_download
-from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
 
 
 @dataclass
@@ -81,22 +78,6 @@ def _load_config_from_path(config_path: Path) -> dict[str, Any]:
 
     with open(config_path, "r") as f:
         return json.load(f)
-
-
-def _load_config_from_hf(model_id: str, revision: Optional[str] = None) -> dict[str, Any]:
-    """Download and load config.json from HuggingFace Hub."""
-    try:
-        config_path = hf_hub_download(
-            repo_id=model_id,
-            filename="config.json",
-            revision=revision,
-        )
-        with open(config_path, "r") as f:
-            return json.load(f)
-    except RepositoryNotFoundError:
-        raise ValueError(f"Model repository not found on HuggingFace: {model_id}")
-    except EntryNotFoundError:
-        raise ValueError(f"config.json not found in model repository: {model_id}")
 
 
 def _parse_config(config: dict[str, Any], model_id: str) -> ModelMetadata:
@@ -212,30 +193,46 @@ def load_model_metadata(
     trust_remote_code: bool = False,
     params_b: Optional[float] = None,
 ) -> ModelMetadata:
-    """Load model metadata from local path or HuggingFace Hub.
+    """Load model metadata from local path or estimate from known model families.
+
+    This function does NOT download models from HuggingFace. For VRAM estimation,
+    we only need the parameter count which can be provided via --params-b or
+    looked up from known model sizes.
 
     Args:
-        model_id_or_path: Local path to model directory or HuggingFace model ID
-        revision: Model revision (branch, tag, commit) for HF models
-        trust_remote_code: Whether to trust remote code (not used for config loading)
-        params_b: Override parameter count in billions
+        model_id_or_path: Model identifier (used for size lookup)
+        revision: Ignored (kept for API compatibility)
+        trust_remote_code: Ignored (kept for API compatibility)
+        params_b: Parameter count in billions. If provided, skips HF download.
 
     Returns:
         ModelMetadata with extracted architecture information
-
-    Raises:
-        FileNotFoundError: If local config.json not found
-        ValueError: If required fields missing from config
     """
-    path = Path(model_id_or_path)
+    # If params_b is provided or can be looked up, use estimated config
+    if params_b is None:
+        params_b = lookup_known_model_size(model_id_or_path)
 
-    # Check if it's a local path
-    if path.exists() and path.is_dir():
-        config_path = path / "config.json"
-        config = _load_config_from_path(config_path)
+    if params_b is not None:
+        # Generate estimated config based on parameter count
+        config = _estimate_config_from_params(params_b)
     else:
-        # Treat as HuggingFace model ID
-        config = _load_config_from_hf(model_id_or_path, revision)
+        # Try to load from local path
+        path = Path(model_id_or_path)
+        if path.exists() and path.is_dir():
+            config_path = path / "config.json"
+            if config_path.exists():
+                config = _load_config_from_path(config_path)
+            else:
+                raise FileNotFoundError(
+                    f"config.json not found in {path}. "
+                    f"Provide --params-b to estimate without config file."
+                )
+        else:
+            # Unknown model without params - use a safe default
+            raise ValueError(
+                f"Cannot determine model parameters for '{model_id_or_path}'.\n"
+                f"Please provide --params-b (e.g., --params-b 7 for 7B model)."
+            )
 
     metadata = _parse_config(config, model_id_or_path)
 
@@ -243,12 +240,95 @@ def load_model_metadata(
     if params_b is not None:
         metadata.num_params = int(params_b * 1e9)
     else:
-        # Try lookup table first
-        known_size = lookup_known_model_size(model_id_or_path)
-        if known_size:
-            metadata.num_params = int(known_size * 1e9)
-        else:
-            # Estimate from config
-            metadata.num_params = estimate_params_from_config(metadata)
+        # Estimate from config
+        metadata.num_params = estimate_params_from_config(metadata)
 
     return metadata
+
+
+def _estimate_config_from_params(params_b: float) -> dict[str, Any]:
+    """Estimate model config from parameter count.
+    
+    Uses typical LLaMA-family architecture patterns.
+    """
+    # Default 7B config
+    config = {
+        "model_type": "llama",
+        "num_hidden_layers": 32,
+        "hidden_size": 4096,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 32,
+        "vocab_size": 32000,
+        "max_position_embeddings": 4096,
+        "intermediate_size": 11008,
+    }
+
+    # Scale based on parameter count
+    if params_b >= 400:
+        # 400B+ (e.g., LLaMA 3.1 405B)
+        config.update({
+            "num_hidden_layers": 126,
+            "hidden_size": 16384,
+            "num_attention_heads": 128,
+            "num_key_value_heads": 128,
+            "vocab_size": 128256,
+            "max_position_embeddings": 131072,
+            "intermediate_size": 53248,
+        })
+    elif params_b >= 70:
+        # 70B (e.g., LLaMA 2 70B)
+        config.update({
+            "num_hidden_layers": 80,
+            "hidden_size": 8192,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,  # GQA
+            "vocab_size": 32000,
+            "max_position_embeddings": 4096,
+            "intermediate_size": 28672,
+        })
+    elif params_b >= 30:
+        # 30-70B (e.g., Mixtral 8x22B ~141B total, Qwen 72B)
+        config.update({
+            "num_hidden_layers": 60,
+            "hidden_size": 6144,
+            "num_attention_heads": 48,
+            "num_key_value_heads": 8,
+            "vocab_size": 151936,
+            "max_position_embeddings": 32768,
+            "intermediate_size": 16384,
+        })
+    elif params_b >= 13:
+        # 13B (e.g., LLaMA 2 13B)
+        config.update({
+            "num_hidden_layers": 40,
+            "hidden_size": 5120,
+            "num_attention_heads": 40,
+            "num_key_value_heads": 40,
+            "vocab_size": 32000,
+            "max_position_embeddings": 4096,
+            "intermediate_size": 13824,
+        })
+    elif params_b >= 3:
+        # 3-7B (e.g., LLaMA 2 7B, Mistral 7B)
+        config.update({
+            "num_hidden_layers": 32,
+            "hidden_size": 4096,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,  # GQA common in this range
+            "vocab_size": 32000,
+            "max_position_embeddings": 8192,
+            "intermediate_size": 14336,
+        })
+    else:
+        # <3B (e.g., Phi-2, Gemma 2B)
+        config.update({
+            "num_hidden_layers": 28,
+            "hidden_size": 2560,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 20,
+            "vocab_size": 51200,
+            "max_position_embeddings": 2048,
+            "intermediate_size": 10240,
+        })
+
+    return config
